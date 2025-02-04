@@ -30,12 +30,13 @@ class local_tcp_server_endpoint_impl
 public:
     local_tcp_server_endpoint_impl(const std::shared_ptr<endpoint_host>& _endpoint_host,
             const std::shared_ptr<routing_host>& _routing_host,
-            const endpoint_type& _local,
             boost::asio::io_context &_io,
             const std::shared_ptr<configuration>& _configuration,
             bool _is_routing_endpoint);
+    virtual ~local_tcp_server_endpoint_impl() = default;
 
-    virtual ~local_tcp_server_endpoint_impl();
+    void init(const endpoint_type& _local, boost::system::error_code& _error);
+    void deinit();
 
     void start();
     void stop();
@@ -149,10 +150,11 @@ private:
     const bool is_routing_endpoint_;
 
 private:
+    void init_unlocked(const endpoint_type& _local, boost::system::error_code& _error);
     bool add_connection(const client_t &_client,
             const std::shared_ptr<connection> &_connection);
     void remove_connection(const client_t &_client);
-    void accept_cbk(const connection::ptr& _connection,
+    void accept_cbk(connection::ptr _connection,
                     boost::system::error_code const &_error);
     std::string get_remote_information(
             const target_data_iterator_type _queue_iterator) const;
@@ -162,7 +164,6 @@ private:
     bool check_packetizer_space(target_data_iterator_type _queue_iterator,
                                 message_buffer_ptr_t* _packetizer,
                                 std::uint32_t _size);
-    bool tp_segmentation_enabled(service_t _service, method_t _method) const;
     void send_client_identifier(const client_t &_client);
 };
 

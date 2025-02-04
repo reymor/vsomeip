@@ -3,6 +3,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+#include <atomic>
 #include <iomanip>
 #include <sstream>
 
@@ -26,18 +27,18 @@ local_uds_client_endpoint_impl::local_uds_client_endpoint_impl(
         const std::shared_ptr<endpoint_host>& _endpoint_host,
         const std::shared_ptr<routing_host>& _routing_host,
         const endpoint_type& _remote,
-        boost::asio::io_context &_io,
+        boost::asio::io_context& _io,
         const std::shared_ptr<configuration>& _configuration)
     : local_uds_client_endpoint_base_impl(_endpoint_host, _routing_host, _remote,
-                                          _remote, _io,
-                                          _configuration->get_max_message_size_local(),
-                                          _configuration->get_endpoint_queue_limit_local(),
-                                          _configuration),
+                                          _remote, _io, _configuration),
                                           // Using _remote for the local(!) endpoint is ok,
                                           // because we have no bind for local endpoints!
       recv_buffer_(VSOMEIP_LOCAL_CLIENT_ENDPOINT_RECV_BUFFER_SIZE, 0) {
 
     is_supporting_magic_cookies_ = false;
+
+    this->max_message_size_ = _configuration->get_max_message_size_local();
+    this->queue_limit_ = _configuration->get_endpoint_queue_limit_local();
 }
 
 bool local_uds_client_endpoint_impl::is_local() const {
@@ -48,7 +49,6 @@ void local_uds_client_endpoint_impl::restart(bool _force) {
     if (!_force && state_ == cei_state_e::CONNECTING) {
         return;
     }
-    state_ = cei_state_e::CONNECTING;
     {
         std::lock_guard<std::recursive_mutex> its_lock(mutex_);
         sending_blocked_ = false;
@@ -59,14 +59,20 @@ void local_uds_client_endpoint_impl::restart(bool _force) {
         std::lock_guard<std::mutex> its_lock(socket_mutex_);
         shutdown_and_close_socket_unlocked(true);
     }
+    state_ = cei_state_e::CONNECTING;
     was_not_connected_ = true;
     reconnect_counter_ = 0;
     start_connect_timer();
 }
 
 void local_uds_client_endpoint_impl::start() {
-
-    connect();
+    if (state_ == cei_state_e::CLOSED) {
+        {
+            std::lock_guard<std::recursive_mutex> its_lock(mutex_);
+            sending_blocked_ = false;
+        }
+        connect();
+    }
 }
 
 void local_uds_client_endpoint_impl::stop() {
@@ -195,8 +201,8 @@ bool local_uds_client_endpoint_impl::send(const uint8_t *_data, uint32_t _size) 
         std::stringstream msg;
         msg << "lce::send: ";
         for (uint32_t i = 0; i < _size; i++)
-            msg << std::hex << std::setw(2) << std::setfill('0')
-                << (int)_data[i] << " ";
+            msg << std::hex << std::setfill('0') << std::setw(2)
+                << static_cast<int>(_data[i]) << " ";
         VSOMEIP_INFO << msg.str();
 #endif
         train_->buffer_->insert(train_->buffer_->end(), _data, _data + _size);
@@ -219,18 +225,12 @@ void local_uds_client_endpoint_impl::send_queued(std::pair<message_buffer_ptr_t,
     {
         std::lock_guard<std::mutex> its_lock(socket_mutex_);
         boost::asio::async_write(
-            *socket_,
-            bufs,
-            std::bind(
-                &client_endpoint_impl::send_cbk,
-                std::dynamic_pointer_cast<
-                    local_uds_client_endpoint_impl
-                >(shared_from_this()),
-                std::placeholders::_1,
-                std::placeholders::_2,
-                _entry.first
-            )
-        );
+                *socket_, bufs,
+                strand_.wrap(std::bind(&client_endpoint_impl::send_cbk,
+                                       std::dynamic_pointer_cast<local_uds_client_endpoint_impl>(
+                                               shared_from_this()),
+                                       std::placeholders::_1, std::placeholders::_2,
+                                       _entry.first)));
     }
 }
 
@@ -258,6 +258,11 @@ void local_uds_client_endpoint_impl::receive_cbk(
         if (_error == boost::asio::error::operation_aborted) {
             // endpoint was stopped
             return;
+        } else if (_error == boost::asio::error::eof) {
+            std::lock_guard<std::recursive_mutex> its_lock(mutex_);
+            sending_blocked_ = false;
+            queue_.clear();
+            queue_size_ = 0;
         } else if (_error == boost::asio::error::connection_reset
                 || _error == boost::asio::error::bad_descriptor) {
             restart(true);
@@ -276,8 +281,8 @@ void local_uds_client_endpoint_impl::receive_cbk(
         std::stringstream msg;
         msg << "lce<" << this << ">::recv: ";
         for (std::size_t i = 0; i < recv_buffer_.size(); i++)
-            msg << std::setw(2) << std::setfill('0') << std::hex
-                << (int)recv_buffer_[i] << " ";
+            msg << std::hex << std::setfill('0') << std::setw(2)
+                << static_cast<int>(recv_buffer_[i]) << " ";
         VSOMEIP_INFO << msg.str();
 #endif
 
@@ -358,15 +363,7 @@ bool local_uds_client_endpoint_impl::is_reliable() const {
 
 std::uint32_t local_uds_client_endpoint_impl::get_max_allowed_reconnects() const {
 
-    return 13;
-}
-
-bool local_uds_client_endpoint_impl::tp_segmentation_enabled(
-        service_t _service, method_t _method) const {
-
-    (void)_service;
-    (void)_method;
-    return false;
+    return MAX_RECONNECTS_LOCAL_UDS;
 }
 
 void local_uds_client_endpoint_impl::max_allowed_reconnects_reached() {
